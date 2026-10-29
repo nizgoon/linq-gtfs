@@ -219,18 +219,49 @@ def build(days):
     F["stops"] = [["stop_id", "stop_name", "stop_desc", "stop_lat", "stop_lon"]] + \
         [[k, v[0], STOP_DESC.get(k, ""), v[1], v[2]] for k, v in STOPS.items() if k in used]
 
-    # ---- fares (/fares): pay on board by debit/credit -> payment_method 0 ---
+    # ---- fares (/fares) -----------------------------------------------------
+    # Written twice: Fares v2 (fare_media / fare_products / fare_leg_rules with
+    # networks) for current consumers, plus Fares v1 (fare_attributes /
+    # fare_rules) for older ones. Both describe the same fares.
     F["fare_attributes"] = [["fare_id", "price", "currency_type", "payment_method", "transfers"]]
     F["fare_rules"] = [["fare_id", "route_id"]]
-    routes_for = {"regular": ["LINQ"], "special_event": ["LINQ-EVT-A", "LINQ-EVT-B"]}
-    for ftype, rids in routes_for.items():
-        cands = sorted((f for f in fares if f.get("fare_type") == ftype),
+    F["networks"] = [["network_id", "network_name"]]
+    F["route_networks"] = [["network_id", "route_id"]]
+    F["fare_media"] = [["fare_media_id", "fare_media_name", "fare_media_type"]]
+    F["fare_products"] = [["fare_product_id", "fare_product_name", "fare_media_id", "amount", "currency"]]
+    F["fare_leg_rules"] = [["leg_group_id", "network_id", "fare_product_id"]]
+    networks = {"regular": ("NET_REGULAR", "Regular Scheduled Bus", ["LINQ"]),
+                "special_event": ("NET_EVENT", "Special Event Bus", ["LINQ-EVT-A", "LINQ-EVT-B"])}
+    media = {}
+    for ftype, (net, net_name, rids) in networks.items():
+        # Same pick as the /fares page: newest fare of this type already in effect
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        cands = sorted((f for f in fares if f.get("fare_type") == ftype
+                        and (f.get("effective_from") or "") <= now),
                        key=lambda f: f.get("effective_from") or "", reverse=True)
-        if cands:
-            f = cands[0]
-            fid = f"FARE_{ftype.upper()}"
-            F["fare_attributes"].append([fid, f"{f['price']:.2f}", f.get("currency", "CAD"), 0, 0])
-            F["fare_rules"] += [[fid, r] for r in rids]
+        if not cands:
+            continue
+        f = cands[0]
+        price, cur = f"{f['price']:.2f}", f.get("currency", "CAD")
+        # v1
+        fid = f"FARE_{ftype.upper()}"
+        F["fare_attributes"].append([fid, price, cur, 0, 0])
+        F["fare_rules"] += [[fid, r] for r in rids]
+        # v2: media from the site's payment wording ("debit or credit card only")
+        pay = (f.get("payment_methods") or "").lower()
+        if "card" in pay or "debit" in pay or "credit" in pay:
+            mid, mname, mtype = "CARD_ONBOARD", "Debit or credit card on the bus", 3   # 3 = cEMV
+        else:
+            mid, mname, mtype = "PAY_ONBOARD", "Pay on the bus", 0                     # 0 = none
+        media[mid] = [mid, mname, mtype]
+        F["networks"].append([net, net_name])
+        F["route_networks"] += [[net, r] for r in rids]
+        pid = f"PROD_{ftype.upper()}_ONE_WAY"
+        label = f.get("trip_label") or "One Way"
+        F["fare_products"].append([pid, f"{f.get('name', net_name)} - {label}", mid, price, cur])
+        F["fare_leg_rules"].append([f"LEG_{ftype.upper()}", net, pid])
+    F["fare_media"] += list(media.values())
+    # No fare_transfer_rules: every boarding is a separate one-way fare.
 
     digest = hashlib.sha1(json.dumps([cols, timetable, events, fares], sort_keys=True)
                           .encode()).hexdigest()[:10]
@@ -245,7 +276,7 @@ def build(days):
 def write_zip(F, path):
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
         for name, rows in F.items():
-            if len(rows) <= 1 and name in ("calendar_dates", "fare_attributes", "fare_rules"):
+            if len(rows) <= 1 and name not in ("agency", "stops", "routes", "trips", "stop_times", "feed_info"):
                 continue
             buf = io.StringIO()
             csv.writer(buf, lineterminator="\n").writerows(rows)
