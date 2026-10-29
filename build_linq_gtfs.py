@@ -57,7 +57,10 @@ VENUES = {
 EVENT_ROUTE = {"EVT_A": "LINQ-EVT-A", "EVT_B": "LINQ-EVT-B"}
 STOP_DESC = {"EVT_A": "Special event stop. Walk to Ford Field or Comerica Park.",
              "EVT_B": "Special event stop. Walk to Little Caesars Arena, Fox Theatre or The Fillmore."}
-EVENT_RUN_MINUTES = 40  # events publish only a pickup time; estimated ride to venue
+EVENT_RUN_MINUTES = 40
+
+# Announced on the site: regular service moves from Bruce Ave to WITT on this date
+WITT_MOVE = dt.date(2026, 11, 1)  # events publish only a pickup time; estimated ride to venue
 
 # Column "service" labels on /schedules -> (pickup_type, drop_off_type)
 SERVICE = {"pick up": (0, 1), "pick up only": (0, 1), "drop off": (1, 0),
@@ -80,6 +83,10 @@ def stop_id(name):
     if not sid:
         sys.exit(f"ERROR: unknown stop/venue on website: {name!r} -> add it to STOPS")
     return sid
+
+
+def col_stops_raw(cols):
+    return [stop_id(n) for n, _ in cols]
 
 
 def js_array(src, start):
@@ -172,32 +179,49 @@ def build(days):
                     f"{SITE}/special-events-bus"]]
 
     # ---- regular service (/schedules + /routes) -----------------------------
-    col_stops = [stop_id(n) for n, _ in cols]
-    col_rules = []
-    for _, svc in cols:
-        if svc.lower() not in SERVICE:
-            sys.exit(f"ERROR: unknown service label {svc!r} - add it to SERVICE")
-        col_rules.append(SERVICE[svc.lower()])
-    used = set(col_stops)
+    # Terminal move announced on the site: from WITT_MOVE the same loop starts
+    # and ends at 300 Chatham St W (WITT) instead of Bruce Ave, with the same
+    # times. The return to WITT reuses the old Bruce return time, so it is
+    # marked as an estimate (timepoint 0). Once the live /schedules page itself
+    # starts at WITT, this does nothing.
+    versions = []
+    if col_stops_raw(cols)[0] == "BRUCE" and horizon >= WITT_MOVE:
+        moved_cols = [("300 Chatham St W", cols[0][1])] + cols[1:-1] + [("300 Chatham St W", cols[-1][1])]
+        if today < WITT_MOVE:
+            versions.append(("", cols, timetable, today, WITT_MOVE - dt.timedelta(days=1), set()))
+        versions.append(("_WITT", moved_cols, timetable, max(today, WITT_MOVE), horizon, {len(cols)}))
+    else:
+        versions.append(("", cols, timetable, today, horizon, set()))
+
+    used = set()
     F["calendar"] = [["service_id"] + DAYS + ["start_date", "end_date"]]
     F["trips"] = [["route_id", "service_id", "trip_id", "trip_headsign", "direction_id", "block_id"]]
     F["stop_times"] = [["trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence",
                         "pickup_type", "drop_off_type", "timepoint"]]
-    for t in timetable:
-        sid = re.sub(r"\W+", "_", t["day"].upper()).strip("_")
-        F["calendar"].append([sid] + day_flags(t["day"]) +
-                             [today.strftime("%Y%m%d"), horizon.strftime("%Y%m%d")])
-        for i, row in enumerate(t["rows"], 1):
-            tid, prev = f"{sid}_{i:02d}", -1
-            F["trips"].append(["LINQ", sid, tid, STOPS[col_stops[-1]][0], 0, f"{sid}_BUS"])
-            for seq, (cell, stp, (pu, do)) in enumerate(zip(row, col_stops, col_rules), 1):
-                if not cell.strip():
-                    continue
-                m = to_min(cell)
-                while m < prev:
-                    m += 1440            # past midnight -> 24:xx
-                prev = m
-                F["stop_times"].append([tid, hms(m), hms(m), stp, seq, pu, do, 1])
+    for suffix, vcols, vtt, vstart, vend, estimated in versions:
+        col_stops = col_stops_raw(vcols)
+        col_rules = []
+        for _, svc in vcols:
+            if svc.lower() not in SERVICE:
+                sys.exit(f"ERROR: unknown service label {svc!r} - add it to SERVICE")
+            col_rules.append(SERVICE[svc.lower()])
+        used.update(col_stops)
+        for t in vtt:
+            sid = re.sub(r"\W+", "_", t["day"].upper()).strip("_") + suffix
+            F["calendar"].append([sid] + day_flags(t["day"]) +
+                                 [vstart.strftime("%Y%m%d"), vend.strftime("%Y%m%d")])
+            for i, row in enumerate(t["rows"], 1):
+                tid, prev = f"{sid}_{i:02d}", -1
+                F["trips"].append(["LINQ", sid, tid, STOPS[col_stops[-1]][0], 0, f"{sid}_BUS"])
+                for seq, (cell, stp, (pu, do)) in enumerate(zip(row, col_stops, col_rules), 1):
+                    if not cell.strip():
+                        continue
+                    m = to_min(cell)
+                    while m < prev:
+                        m += 1440            # past midnight -> 24:xx
+                    prev = m
+                    F["stop_times"].append([tid, hms(m), hms(m), stp, seq, pu, do,
+                                            0 if seq in estimated else 1])
 
     # ---- special event buses (/special-events-bus) -------------------------
     F["calendar_dates"] = [["service_id", "date", "exception_type"]]
